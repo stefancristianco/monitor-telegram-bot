@@ -16,6 +16,8 @@ RUN apt-get update \
     && useradd -u 1000 -G sudo -U -m -s /bin/bash crst \
     && echo "crst ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
 
+WORKDIR /home/crst/bot
+
 USER crst
 
 # Install development tools
@@ -23,3 +25,4 @@ RUN pip install python-telegram-bot --pre && \
     pip install requests && \
     pip install black
 
+CMD ["python", "./scripts/main.py"]
