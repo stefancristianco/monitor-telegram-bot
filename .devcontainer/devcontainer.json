@@ -1,0 +1,29 @@
+{
+    "name": "Telegram Bot Develop",
+    "build": {
+        "dockerfile": "Dockerfile",
+        "context": ".."
+    },
+    "settings": {
+        "terminal.integrated.profiles.linux": {
+            "bash": {
+                "path": "/bin/bash"
+            }
+        },
+        "editor.insertSpaces": true,
+        "files.trimTrailingWhitespace": true,
+        "[markdown]": {
+            "files.trimTrailingWhitespace": false
+        },
+        "python.pythonPath": "/usr/local/bin/python"
+    },
+    // Add the IDs of extensions you want installed when the container is created.
+    "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "davidanson.vscode-markdownlint",
+        "ms-azuretools.vscode-docker",
+        "vscode-icons-team.vscode-icons"
+    ],
+    "remoteUser": "crst"
+}
