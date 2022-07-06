@@ -1,5 +1,5 @@
 {
-    "name": "Telegram Bot Develop",
+    "name": "Telegram node monitor bot",
     "build": {
         "dockerfile": "Dockerfile",
         "context": ".."
@@ -25,5 +25,5 @@
         "ms-azuretools.vscode-docker",
         "vscode-icons-team.vscode-icons"
     ],
-    "remoteUser": "crst"
+    "remoteUser": "bot"
 }

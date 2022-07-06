@@ -5,7 +5,7 @@ FROM python:3.10.5-slim-bullseye as base
 #
 
 # Setup env
-ENV PATH=/home/crst/.local/bin:$PATH
+ENV PATH=/home/bot/.local/bin:$PATH
 
 # Install OS packages
 RUN apt-get update \
@@ -13,12 +13,12 @@ RUN apt-get update \
     && apt-get -y install sudo git build-essential black \
     && apt-get clean \
     && pip install --upgrade pip \
-    && useradd -u 1000 -G sudo -U -m -s /bin/bash crst \
-    && echo "crst ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+    && useradd -u 1000 -G sudo -U -m -s /bin/bash bot \
+    && echo "bot ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
 
-WORKDIR /home/crst/bot
+WORKDIR /home/bot
 
-USER crst
+USER bot
 
 # Install development tools
 RUN pip install python-telegram-bot --pre && \
