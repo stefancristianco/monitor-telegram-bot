@@ -23,6 +23,7 @@ USER bot
 # Install development tools
 RUN pip install python-telegram-bot --pre && \
     pip install requests && \
+    pip install web3 && \
     pip install black
 
 CMD ["python", "./scripts/main.py"]

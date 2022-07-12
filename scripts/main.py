@@ -32,6 +32,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+config = {}
+with open(CONFIG_DB, "r") as infile:
+    config = json.load(infile)
+
+
 async def chatid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Print chatid. This is needed to secure bot chat.
@@ -40,18 +45,36 @@ async def chatid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(text=f"CHAT ID: {update.message.chat_id}")
 
 
+async def help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Print help.
+    :return: None
+    """
+    text = (
+        "HELP\n\n"
+        "Public commands\n\n"
+        "    Anyone can call these commands if they start \na conversation with this bot.\n\n"
+        f"    /{'help'.ljust(15)} Print this help message.\n"
+        f"    /{'chatid'.ljust(15)} Display telegram chat id.\n\n\n"
+        "Restricted commands\n\n"
+        "    These commands are restricted to the configured chat id's.\n"
+        "Check online documentation for more details on how to gain access to these commands.\n"
+    )
+    for ext_name in config["extensions"]:
+        text = f"{text}\n    /{ext_name.ljust(15)} {config['extensions'][ext_name]['description']}"
+    text = f"{text}\n\n\nTIP: use '/cmd help' to see additional help instructions (e.g. '/forta help')."
+    await update.message.reply_text(text=text)
+
+
 def main() -> None:
     """
     This function will initiate and start the bot.
     :return: None
     """
-    config = {}
-    with open(CONFIG_DB, "r") as infile:
-        config = json.load(infile)
-
     builder = Application.builder()
     application = builder.token(token=config["bot"]["token"]).build()
 
+    # restrict access to configured chat id's
     restrict_access_filter = filters.User(
         user_id=[int(arg) for arg in config["bot"]["allowed_users"]]
     )
@@ -67,6 +90,7 @@ def main() -> None:
             )
         )
 
+    application.add_handler(CommandHandler("help", help))
     application.add_handler(CommandHandler("chatid", chatid))
 
     application.run_polling()
