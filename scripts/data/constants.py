@@ -1,1 +1,1 @@
-CONFIG_DB = "config.db"
+CONFIG_DB = "config.json"

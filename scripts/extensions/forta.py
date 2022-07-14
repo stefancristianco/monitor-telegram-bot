@@ -5,10 +5,11 @@ import logging
 import json
 import requests
 
-from typing import List
+from typing import Any, List
 
 from telegram import Update
 from telegram.ext import ContextTypes
+from web3 import Web3
 
 from helpers.utils import (
     job_exist,
@@ -19,6 +20,45 @@ from helpers.utils import (
 from extensions.extension_base import ExtensionBase
 
 logger = logging.getLogger(__name__)
+
+HELP = """HELP
+
+AVAILABLE ACTIONS
+[/forta help]
+    Print this help message.
+[/forta scanner add :friendly-name: :address:]
+    Add new scanner address to monitor.
+    :param friendly-name: Friendly name for the scanner.
+    :param address: Scanner address.
+[/forta scanner alert :sla-threshold:]
+    Set SLA threshold value for generating alerts (default: 0.95).
+    :param sla-threshold: SLA threshold to produce alerts.
+[/forta scanner remove :friendly-name:]
+    Remove a given scanner from monitoring list.
+    :param friendly-name: Friendly name for the scanner.
+[/forta scanner status]
+    Query SLA for all registered scanner nodes.
+[/forta scanner list]
+    Show all registered scanner nodes.
+[/forta wallet add :friendly-name: :address:]
+    Add new wallet address to monitor for FORT balance updates.
+    :param friendly-name: Friendly name for the wallet.
+    :param address: Wallet address.
+[/forta wallet remove :friendly-name:]
+    Add new wallet address to monitor for FORT balance updates.
+    :param friendly-name: Friendly name for the wallet.
+[/forta wallet balance :friendly-name:]
+    Show current balance for wallet.
+    :param friendly-name: Friendly name for the wallet.
+[/forta wallet list]
+    Show all regitered wallets.
+[/forta chain list]
+    Show all configured chains.
+[/forta start]
+    Start monitoring wallet and scanner nodes.
+[/forta stop]
+    Stop monitoring wallet and scanner nodes.
+"""
 
 
 class Forta(ExtensionBase):
@@ -34,13 +74,17 @@ class Forta(ExtensionBase):
         self.config = forta_config
         try:
             self.scanner_status = {}
-            self.scanner_info = {}
+            self.user_config = {"scanners": {}, "wallets": {}, "threshold": "0.95"}
             with open(self.config["db_path"], "r") as infile:
-                self.scanner_info = json.load(infile)
+                self.user_config = json.load(infile)
         except:
             # Non critical error, as first time run it is expected
             # that this file is missing
             logger.exception(f"Missing {self.config['db_path']}")
+
+        self.ERC20_ABI = {}
+        with open("./scripts/extensions/abis/ERC20.json", "r") as infile:
+            self.ERC20_ABI = json.load(infile)
 
     def execute_request(self, address: str) -> str:
         """
@@ -50,186 +94,58 @@ class Forta(ExtensionBase):
         """
         return requests.get(f"{self.config['url']}{address}")
 
-    def validate_address(self, address: str) -> bool:
-        """
-        Check validity of scanner node address.
-        :param address: scanner node address to check.
-        :return: True if scanner node address is valid and known by forta network, False otherwise.
-        """
-        if not validate_address(address):
-            logger.error("Address not valid")
-            return False
-        sla = self.execute_request(address)
-        if sla.status_code != 200:
-            logger.error(f"Response: {sla} - {sla.text}")
-            return False
-        return True
-
-    def job_name(self, update: Update) -> str:
+    def job_name(self) -> str:
         """
         Creates an unique job name for this extension.
         :return: job name as string.
         """
-        chat_id = update.message.chat_id
-        return f"FORTA:{chat_id}"
-
-    def parse_action_add_validate_options(self, opt) -> bool:
-        """
-        Validate all options for action "add".
-        :param opt: dictionary of options to check.
-        :return: True if all options are valid, False otherwise.
-        """
-        try:
-            if not validate_name(opt["name"]):
-                logger.error("Name not valid")
-                return False
-            if float(opt["sla"]) < 0 or float(opt["sla"]) >= 1:
-                logger.error("SLA threshold not valid")
-                return False
-            return self.validate_address(opt["address"])
-        except:
-            logger.exception("Error during options validation")
-        return False
-
-    async def parse_action_add(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, args: List[str]
-    ) -> None:
-        """
-        Execute action "add".
-        :param args: list of options for action "add".
-        :return: None.
-        """
-        if args:
-            try:
-                opt = {arg.split("=")[0]: arg.split("=")[1] for arg in args}
-                if self.parse_action_add_validate_options(opt):
-                    self.scanner_info[opt["address"]] = {
-                        "name": opt["name"],
-                        "sla": opt["sla"],
-                    }
-                    if opt["address"] in self.scanner_status:
-                        del self.scanner_status[opt["address"]]
-                    with open(self.config["db_path"], "w") as outfile:
-                        json.dump(self.scanner_info, outfile)
-                    await update.message.reply_text(
-                        text=f"SCANNER UPDATED:\n{opt['address']}"
-                    )
-                else:
-                    await update.message.reply_text(text="Invalid arguments")
-            except IndexError:
-                await update.message.reply_text(text="Invalid 'action' arguments")
-            except:
-                logger.exception("Failed to add scanner")
-                await update.message.reply_text(text="Operation failed")
-        else:
-            await update.message.reply_text(text="Missing 'action' arguments")
-
-    async def parse_action_remove(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE, args: List[str]
-    ) -> None:
-        """
-        Execute action "remove".
-        :param args: list of options for action "remove".
-        :return: None.
-        """
-        if args:
-            try:
-                if validate_address(args[0]):
-                    if args[0] in self.scanner_status:
-                        del self.scanner_status[args[0]]
-                    del self.scanner_info[args[0]]
-                    with open(self.config["db_path"], "w") as outfile:
-                        json.dump(self.scanner_info, outfile)
-                    await update.message.reply_text(text=f"SCANNER REMOVED:\n{args[0]}")
-                else:
-                    await update.message.reply_text(text="Address not valid")
-            except:
-                logger.exception(f"Failed to remove key: {args[0]}")
-                await update.message.reply_text(text="Operation failed")
-        else:
-            await update.message.reply_text(text="Missing 'action' arguments")
-
-    async def parse_action_status(
-        self,
-        update: Update,
-        context: ContextTypes.DEFAULT_TYPE,
-        *args,
-        **kwargs,
-    ) -> None:
-        """
-        Dump SLA for all scanner nodes.
-        """
-        status = "active" if job_exist(context, self.job_name(update)) else "inactive"
-        result = f"SCANNER STATUS (monitoring: {status}):\n"
-        for address in self.scanner_info:
-            sla = self.execute_request(address)
-            if sla.status_code == 200:
-                json_sla = json.loads(sla.text)
-                result = f"{result}\n{self.scanner_info[address]['name']}: {json_sla['statistics']['avg']}"
-            else:
-                logger.error(f"Failed request for address: {address} {sla}")
-                result = f"{result}\n{self.scanner_info[address]['name']}: FAILED"
-        await update.message.reply_text(text=result)
-
-    async def parse_action_list(self, update: Update, *args, **kwargs) -> None:
-        """
-        Dump scanner nodes config information.
-        """
-        result = "SCANNER CONFIG:\n"
-        for address in self.scanner_info:
-            result = (
-                f"{result}\n{self.scanner_info[address]['name']}:\n"
-                f"    * address: {address}\n"
-                f"    * threashold sla: {self.scanner_info[address]['sla']}"
-            )
-        await update.message.reply_text(text=result)
+        return "FORTA"
 
     async def execute_pooling(self, context: ContextTypes.DEFAULT_TYPE) -> None:
         """
         Pool on forta SLA.
+        :return: None
         """
         job = context.job
-        for address in self.scanner_info:
+        for friendly_name in self.user_config["scanners"]:
+            address = self.user_config["scanners"][friendly_name]
             sla = self.execute_request(address)
             if sla.status_code == 200:
                 json_sla = json.loads(sla.text)
-                if address in self.scanner_status:
-                    if float(self.scanner_status[address]) <= float(
+                if friendly_name in self.scanner_status:
+                    if float(self.scanner_status[friendly_name]) <= float(
                         json_sla["statistics"]["avg"]
                     ):
                         # Only produce alerts if conditions degrade
-                        self.scanner_status[address] = json_sla["statistics"]["avg"]
+                        self.scanner_status[friendly_name] = json_sla["statistics"][
+                            "avg"
+                        ]
                         continue
 
                 if float(json_sla["statistics"]["avg"]) <= float(
-                    self.scanner_info[address]["sla"]
+                    self.user_config["threshold"]
                 ):
                     alert = (
                         f"SCANNER ALERT\n"
-                        f"{self.scanner_info[address]['name']}: {json_sla['statistics']['avg']}"
+                        f"{friendly_name}: {json_sla['statistics']['avg']}"
                     )
                     logger.info(f"New alert: {alert}")
                     await context.bot.send_message(chat_id=job.chat_id, text=alert)
                 # Remember this value so we produce new allerts only if SLA degrades
-                self.scanner_status[address] = json_sla["statistics"]["avg"]
+                self.scanner_status[friendly_name] = json_sla["statistics"]["avg"]
             else:
-                logger.error(f"Request failed: {address} {sla}")
+                logger.error(f"Request failed: {friendly_name} {sla}")
                 await context.bot.send_message(
                     chat_id=job.chat_id,
-                    text=(
-                        f"SCANNER ALERT:\n"
-                        f"{self.scanner_info[address]['name']}: request failed"
-                    ),
+                    text=(f"SCANNER ALERT\n{friendly_name}: request failed"),
                 )
 
-    def remove_job_if_exists(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE
-    ) -> bool:
+    def remove_job_if_exists(self, context: ContextTypes.DEFAULT_TYPE) -> bool:
         """
         Remove forta monitor job.
         :return: True if job was found and removed, False otherwise.
         """
-        return remove_job_if_exists(context, self.job_name(update))
+        return remove_job_if_exists(context, self.job_name())
 
     async def parse_action_start(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs
@@ -238,7 +154,7 @@ class Forta(ExtensionBase):
         Add a job to monitor scanner nodes.
         :return: None
         """
-        job_removed = self.remove_job_if_exists(update, context)
+        job_removed = self.remove_job_if_exists(context)
         logger.info(f"Monitor job removed (result:{job_removed})")
 
         pooling_interval = float(self.config["pooling_interval"])
@@ -246,7 +162,7 @@ class Forta(ExtensionBase):
             callback=self.execute_pooling,
             interval=pooling_interval,
             chat_id=update.message.chat_id,
-            name=self.job_name(update),
+            name=self.job_name(),
         )
         await update.message.reply_text("Monitoring started")
 
@@ -257,7 +173,7 @@ class Forta(ExtensionBase):
         Stop monitoring scanner nodes.
         :return: None
         """
-        job_removed = self.remove_job_if_exists(update, context)
+        job_removed = self.remove_job_if_exists(context)
         logger.info(f"Monitor job removed (result:{job_removed})")
 
         await update.message.reply_text("Monitoring stopped")
@@ -269,7 +185,316 @@ class Forta(ExtensionBase):
         Print usage.
         :return: None
         """
-        await update.message.reply_text("TODO")
+        await update.message.reply_text(text=HELP)
+
+    async def do_actions(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        actions: Any,
+        args: List[str],
+    ) -> None:
+        if args:
+            try:
+                await actions[args[0]](update, context, args[1:])
+            except KeyError:
+                logger.exception(f"Unknown action: {args[0]}")
+                await update.message.reply_text(
+                    text=f"Unknown action: {args[0]}\n{actions.keys()}"
+                )
+            except:
+                logger.exception("Operation failed")
+                await update.message.reply_text(text="Operation failed")
+        else:
+            await update.message.reply_text(
+                text=f"Missing 'action' parameter\n{actions.keys()}"
+            )
+
+    async def parse_action_scanner_add(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, args: List[str]
+    ) -> None:
+        """
+        Add/Update scanner.
+        :param args: options list, syntax "scanner add :friendly-name: :address:".
+        :return: None.
+        """
+        try:
+            friendly_name = args[0]
+            address = args[1]
+            if not validate_name(friendly_name):
+                await update.message.reply_text(text="Friendly name not valid")
+            elif not validate_address(address):
+                await update.message.reply_text(text="Scanner address format not valid")
+            else:
+                sla = self.execute_request(address)
+                if sla.status_code != 200:
+                    await update.message.reply_text(text="Scanner address not valid")
+                else:
+                    self.user_config["scanners"][friendly_name] = address
+                    with open(self.config["db_path"], "w") as outfile:
+                        json.dump(self.user_config, outfile)
+
+                    await update.message.reply_text(
+                        text=f"SCANNER UPDATED\n{friendly_name}: {address}"
+                    )
+        except IndexError:
+            logger.exception("Invalid action 'scanner add' arguments")
+            await update.message.reply_text(
+                text="Invalid action 'scanner add' arguments"
+            )
+
+    async def parse_action_scanner_remove(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, args: List[str]
+    ) -> None:
+        """
+        Remove scanner.
+        :param args: options list, syntax "scanner remove :friendly-name:".
+        :return: None.
+        """
+        try:
+            friendly_name = args[0]
+            if not validate_name(friendly_name):
+                await update.message.reply_text(text="Friendly name not valid")
+            elif not friendly_name in self.user_config["scanners"]:
+                await update.message.reply_text(text="Unknown scanner name")
+            else:
+                del self.user_config["scanners"][friendly_name]
+                if friendly_name in self.scanner_status:
+                    del self.scanner_status[friendly_name]
+                with open(self.config["db_path"], "w") as outfile:
+                    json.dump(self.user_config, outfile)
+
+                await update.message.reply_text(
+                    text=f"SCANNER REMOVED\n{friendly_name}"
+                )
+        except IndexError:
+            logger.exception("Invalid action 'scanner remove' arguments")
+            await update.message.reply_text(
+                text="Invalid action 'scanner remove' arguments"
+            )
+
+    async def parse_action_scanner_alert(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, args: List[str]
+    ) -> None:
+        """
+        Set SLA alert threshold.
+        :param args: options list, syntax "scanner alert :sla-threshold:".
+        :return: None.
+        """
+        try:
+            threshold = float(args[0])
+            if threshold <= 0 or threshold >= 1:
+                await update.message.reply_text(text="Threshold interval is (0..1)")
+            self.user_config["threshold"] = threshold
+            with open(self.config["db_path"], "w") as outfile:
+                json.dump(self.user_config, outfile)
+            self.scanner_status.clear()
+            await update.message.reply_text(
+                text=f"ALERT UPDATED\nsla-threshold: {threshold}"
+            )
+        except IndexError:
+            logger.exception("Invalid action 'scanner alert' arguments")
+            await update.message.reply_text(
+                text="Invalid action 'scanner alert' arguments"
+            )
+        except ValueError:
+            logger.exception("Invalid number value")
+            await update.message.reply_text(text="Invalid number value")
+
+    async def parse_action_scanner_status(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs
+    ) -> None:
+        """
+        Dump SLA for all scanner nodes.
+        """
+        status = "ACTIVE" if job_exist(context, self.job_name()) else "INACTIVE"
+        result = f"SCANNER STATUS ({status})\n"
+        for friendly_name in self.user_config["scanners"]:
+            sla = self.execute_request(self.user_config["scanners"][friendly_name])
+            if sla.status_code == 200:
+                json_sla = json.loads(sla.text)
+                result = f"{result}\n{friendly_name}: {json_sla['statistics']['avg']}"
+            else:
+                logger.error(f"Failed request for: {friendly_name} {sla}")
+                result = f"{result}\n{friendly_name}: FAILED"
+        result = f"{result}\nCOUNT: {len(self.user_config['scanners'])}"
+        await update.message.reply_text(text=result)
+
+    async def parse_action_scanner_list(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs
+    ) -> None:
+        """
+        Dump scanner nodes config information.
+        """
+        result = f"SCANNER CONFIG (SLA-THRESHOLD: {self.user_config['threshold']})\n"
+        for friendly_name in self.user_config["scanners"]:
+            result = f"{result}\n{friendly_name}:\n  * {self.user_config['scanners'][friendly_name]}"
+        await update.message.reply_text(text=result)
+
+    async def parse_action_scanner(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, args: List[str]
+    ) -> None:
+        """
+        Parse 'scanner' action.
+        :return: None
+        """
+        forta_actions_scanner = {
+            "add": self.parse_action_scanner_add,
+            "remove": self.parse_action_scanner_remove,
+            "alert": self.parse_action_scanner_alert,
+            "status": self.parse_action_scanner_status,
+            "list": self.parse_action_scanner_list,
+        }
+        await self.do_actions(update, context, forta_actions_scanner, args)
+
+    async def parse_action_wallet_add(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, args: List[str]
+    ) -> None:
+        """
+        Add/Update user wallet.
+        :param args: options list, syntax "wallet add :friendly-name: :address:".
+        :return: None.
+        """
+        try:
+            friendly_name = args[0]
+            address = args[1]
+            if not validate_name(friendly_name):
+                await update.message.reply_text(text="Friendly name not valid")
+            elif not validate_address(address):
+                await update.message.reply_text(text="Wallet address format not valid")
+            else:
+                self.user_config["wallets"][friendly_name] = address
+                with open(self.config["db_path"], "w") as outfile:
+                    json.dump(self.user_config, outfile)
+
+                await update.message.reply_text(
+                    text=f"WALLET UPDATED\n{friendly_name}: {address}"
+                )
+        except IndexError:
+            logger.exception("Invalid action 'wallet add' arguments")
+            await update.message.reply_text(
+                text="Invalid action 'wallet add' arguments"
+            )
+
+    async def parse_action_wallet_remove(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, args: List[str]
+    ) -> None:
+        """
+        Remove user wallet.
+        :param args: options list, syntax "wallet remove :friendly-name:".
+        :return: None.
+        """
+        try:
+            friendly_name = args[0]
+            if not friendly_name in self.user_config["wallets"]:
+                await update.message.reply_text(text="Unknown wallet name")
+            else:
+                del self.user_config["wallets"][friendly_name]
+                with open(self.config["db_path"], "w") as outfile:
+                    json.dump(self.user_config, outfile)
+
+                await update.message.reply_text(text=f"WALLET REMOVED\n{friendly_name}")
+        except IndexError:
+            logger.exception("Invalid action 'wallet remove' arguments")
+            await update.message.reply_text(
+                text="Invalid action 'wallet remove' arguments"
+            )
+
+    async def parse_action_wallet_balance(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, args: List[str]
+    ) -> None:
+        """
+        Show wallet balance.
+        :param args: options list, syntax "wallet balance :friendly-name:".
+        :return: None.
+        """
+        try:
+            friendly_name = args[0]
+            if not friendly_name in self.user_config["wallets"]:
+                await update.message.reply_text(text="Unknown wallet name")
+            else:
+                result = f"WALLET BALANCE ({friendly_name}):\n"
+                for chain_name in self.config["chains"]:
+                    provider = Web3(
+                        Web3.WebsocketProvider(self.config["chains"][chain_name]["url"])
+                    )
+                    if not provider.isConnected():
+                        result = f"{result}\n{chain_name}: connection failed"
+                    else:
+                        # Query balanceOf for wallet-token pair
+                        contract = provider.eth.contract(
+                            self.config["chains"][chain_name]["token"],
+                            abi=self.ERC20_ABI,
+                        )
+                        symbol = contract.functions.symbol().call()
+                        decimals = contract.functions.decimals().call()
+
+                        wallet = self.user_config["wallets"][friendly_name]
+                        balance = contract.functions.balanceOf(wallet).call()
+
+                        result = f"{result}\n{chain_name}: {Web3.fromWei(balance * 10 ** (18 - decimals), 'ether')} {symbol}"
+
+                await update.message.reply_text(text=result)
+        except IndexError:
+            logger.exception("Invalid action 'wallet balance' arguments")
+            await update.message.reply_text(
+                text="Invalid action 'wallet balance' arguments"
+            )
+
+    async def parse_action_wallet_list(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs
+    ) -> None:
+        """
+        Show all configured wallets.
+        :return: None
+        """
+        result = "WALLET CONFIG\n"
+        for wallet_name in self.user_config["wallets"]:
+            result = (
+                f"{result}\n{wallet_name}: {self.user_config['wallets'][wallet_name]}"
+            )
+        await update.message.reply_text(text=result)
+
+    async def parse_action_wallet(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, args: List[str]
+    ) -> None:
+        """
+        Parse 'wallet' action.
+        :return: None
+        """
+        forta_actions_wallet = {
+            "add": self.parse_action_wallet_add,
+            "remove": self.parse_action_wallet_remove,
+            "balance": self.parse_action_wallet_balance,
+            "list": self.parse_action_wallet_list,
+        }
+        await self.do_actions(update, context, forta_actions_wallet, args)
+
+    async def parse_action_chain_list(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs
+    ) -> None:
+        """
+        Show all configured chains.
+        :return: None
+        """
+        result = "CHAIN CONFIG\n"
+        for chain_name in self.config["chains"]:
+            result = (
+                f"{result}\n{chain_name}:\n"
+                f"    * url: {self.config['chains'][chain_name]['url']}\n"
+                f"    * token: {self.config['chains'][chain_name]['token']}"
+            )
+        await update.message.reply_text(text=result)
+
+    async def parse_action_chain(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, args: List[str]
+    ) -> None:
+        """
+        Parse 'chain' action.
+        :return: None
+        """
+        forta_actions_chain = {"list": self.parse_action_chain_list}
+        await self.do_actions(update, context, forta_actions_chain, args)
 
     async def execute_action(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -279,22 +504,11 @@ class Forta(ExtensionBase):
         :return: None
         """
         forta_actions = {
-            "add": {"func": self.parse_action_add},
-            "remove": {"func": self.parse_action_remove},
-            "status": {"func": self.parse_action_status},
-            "list": {"func": self.parse_action_list},
-            "start": {"func": self.parse_action_start},
-            "stop": {"func": self.parse_action_stop},
-            "help": {"func": self.parse_action_help},
+            "scanner": self.parse_action_scanner,
+            "wallet": self.parse_action_wallet,
+            "chain": self.parse_action_chain,
+            "start": self.parse_action_start,
+            "stop": self.parse_action_stop,
+            "help": self.parse_action_help,
         }
-
-        if context.args:
-            try:
-                await forta_actions[context.args[0]]["func"](
-                    update, context, context.args[1:]
-                )
-            except:
-                logger.exception("Failed to perform action")
-                await update.message.reply_text(text="Unknown 'action' parameter")
-        else:
-            await update.message.reply_text(text="Missing 'action' parameter")
+        await self.do_actions(update, context, forta_actions, context.args)

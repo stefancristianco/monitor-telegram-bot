@@ -1,4 +1,4 @@
-FROM python:3.10.5-slim-bullseye as base
+FROM python:3.9-slim-bullseye as base
 
 #
 # Prepare environment
@@ -16,7 +16,7 @@ RUN apt-get update \
     && useradd -u 1000 -G sudo -U -m -s /bin/bash bot \
     && echo "bot ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
 
-WORKDIR /home/bot
+WORKDIR /home/bot/telegram-bot
 
 USER bot
 

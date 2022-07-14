@@ -36,6 +36,22 @@ config = {}
 with open(CONFIG_DB, "r") as infile:
     config = json.load(infile)
 
+HELP = """HELP
+
+PUBLIC COMMANDS
+    Anyone can call these commands if they start a conversation with this bot.
+[/help]
+    Print this help message.
+[/chatid]
+    Display telegram chat id.
+
+RESTRICTED COMMANDS
+    These commands are restricted to the configured chat id's. Check online documentation for more details on how to gain access to these commands.
+"""
+for ext_name in config["extensions"]:
+    HELP = f"{HELP}[/{ext_name}]\n    {config['extensions'][ext_name]['description']}\n"
+HELP = f"{HELP}\nTIP: use '/cmd help' to see additional help instructions."
+
 
 async def chatid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
@@ -50,20 +66,7 @@ async def help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     Print help.
     :return: None
     """
-    text = (
-        "HELP\n\n"
-        "Public commands\n\n"
-        "    Anyone can call these commands if they start \na conversation with this bot.\n\n"
-        f"    /{'help'.ljust(15)} Print this help message.\n"
-        f"    /{'chatid'.ljust(15)} Display telegram chat id.\n\n\n"
-        "Restricted commands\n\n"
-        "    These commands are restricted to the configured chat id's.\n"
-        "Check online documentation for more details on how to gain access to these commands.\n"
-    )
-    for ext_name in config["extensions"]:
-        text = f"{text}\n    /{ext_name.ljust(15)} {config['extensions'][ext_name]['description']}"
-    text = f"{text}\n\n\nTIP: use '/cmd help' to see additional help instructions (e.g. '/forta help')."
-    await update.message.reply_text(text=text)
+    await update.message.reply_text(text=HELP)
 
 
 def main() -> None:

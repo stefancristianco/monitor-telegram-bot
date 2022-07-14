@@ -1,4 +1,5 @@
 """
+[WIP]
 Extension to monitor ERC20 SC. Provides allerts when amount of funds have changed.
 """
 import logging
@@ -457,26 +458,6 @@ class Erc20(ExtensionBase):
         """
         return remove_job_if_exists(context, self.job_name(update))
 
-    async def handle_event(
-        self,
-        context: ContextTypes.DEFAULT_TYPE,
-        chain_name: str,
-        wt_name: str,
-        in_out: str,
-        event: Any,
-    ) -> None:
-        """
-        TODO
-        """
-        symbol = self.chains[chain_name]["monitor"][wt_name]["symbol"]
-        decimals = self.chains[chain_name]["monitor"][wt_name]["decimals"]
-        amount = event["args"]["value"]
-
-        alert = f"TRANSFER ALERT\n{chain_name} - {wt_name}: {in_out}{Web3.fromWei(amount * 10 ** (18 - decimals), 'ether')} {symbol}"
-
-        logger.info(f"New alert: {alert}")
-        await context.bot.send_message(chat_id=context.job.chat_id, text=alert)
-
     async def execute_pooling(self, context: ContextTypes.DEFAULT_TYPE) -> None:
         """
         Pool on ERC20 transfers.
@@ -491,10 +472,26 @@ class Erc20(ExtensionBase):
                 outgoing_filter = self.chains[chain_name]["monitor"][wt_name][
                     "outgoing_filter"
                 ]
+
+                async def handle_event(
+                    in_out: str,
+                    event: Any,
+                ) -> None:
+                    symbol = self.chains[chain_name]["monitor"][wt_name]["symbol"]
+                    decimals = self.chains[chain_name]["monitor"][wt_name]["decimals"]
+                    amount = event["args"]["value"]
+
+                    alert = f"TRANSFER ALERT\n{chain_name} - {wt_name}: {in_out}{Web3.fromWei(amount * 10 ** (18 - decimals), 'ether')} {symbol}"
+
+                    logger.info(f"New alert: {alert}")
+                    await context.bot.send_message(
+                        chat_id=context.job.chat_id, text=alert
+                    )
+
                 for event in incoming_filter.get_new_entries():
-                    await self.handle_event(context, chain_name, wt_name, "+", event)
+                    await handle_event("+", event)
                 for event in outgoing_filter.get_new_entries():
-                    await self.handle_event(context, chain_name, wt_name, "-", event)
+                    await handle_event("-", event)
 
     async def parse_action_start(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs
