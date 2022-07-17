@@ -82,13 +82,15 @@ def main() -> None:
         user_id=[int(arg) for arg in config["bot"]["allowed_users"]]
     )
 
-    for ext_name in config["extensions"]:
+    extensions = {
+        ext_name: get_extension_by_name(ext_name)(config["extensions"][ext_name])
+        for ext_name in config["extensions"]
+    }
+    for ext_name in extensions:
         application.add_handler(
             CommandHandler(
                 ext_name,
-                get_extension_by_name(ext_name)(
-                    config["extensions"][ext_name]
-                ).execute_action,
+                extensions[ext_name].execute_action,
                 restrict_access_filter,
             )
         )

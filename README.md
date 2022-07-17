@@ -1,14 +1,14 @@
 # Forta monitor telegram bot
 
-A telegram bot that monitors Forta Network scanners and send message alerts when SLA drops below configured threshold.
+A telegram bot that monitors Forta Network scanners and sends message alerts when SLA drops below configured threshold.
 
-Additionally the bot can subscribe to FORT token Transfer events and alert when a new tokens are distributed to the configured wallets. As example, it can be used to get notifyed when new rewards are distributed.
+Additionally the bot can subscribe to FORT token Transfer events and alert when new tokens are distributed to the configured wallets. As an example, it can be used to get notified when new rewards are distributed.
 
 ## Environment setup
 
 ### VPS
 
-You will need to install and run the bot 24/7, so my recommended method is to aquire a cheep VPS. There are many providers online, so just find one that is convenient for you, or simply run it along side one of your scanner nodes.
+You will need to install and run the bot 24/7, so my recommended method is to acquire a cheap VPS. There are many providers online, so just find one that is convenient for you, or simply run it alongside one of your scanner nodes.
 
 ### Creating a Telegram Bot
 
@@ -40,7 +40,7 @@ docker build -t docker-telegram-bot .
 Some configuration is necessary at this step before actually running the bot. A python script will generate a template for you to start with. Start the container in interactive mode and run the script using python from within the container:
 
 ```sh
-$ docker run --rm -it -v`pwd`:/home/bot/telegram-bot docker-telegram-bot /bin/bash
+docker run --rm -it -v`pwd`:/home/bot/telegram-bot docker-telegram-bot /bin/bash
 (container) $ cd /home/bot/telegram-bot
 (container) $ python ./scripts/get_config.py
 (container) $ exit
@@ -80,7 +80,7 @@ nano config.json
 }
 ```
 
-You will need to edit the following entrie:
+You will need to edit the following entries:
 
 - Secret Bot token that was provided to you by BotFather. This token controls your bot.
 - Your chatid. Your bot is public, so anyone can find it and interact with it. This id is used to make sure nobody else can send commands to your bot, except you. We will get back to this step a bit later.
@@ -92,7 +92,7 @@ You will need to edit the following entrie:
 },
 ```
 
-- The bot also notifies when FORT token is sent to your wallet address. This can be useful to know when rewards have been distributed. Go to your favorite provider and get two url's, one for Ethereum mainnet and one for Polygon mainnet. Attention that the endpoint MUST start with "wss://" and MUST support "eth_subscribe". Most providers do support these features, but just in case, I tested using a free plan (NOT the public one) from [Blast](https://blastapi.io/):
+- The bot also notifies you when FORT tokens are sent to your wallet address. This can be useful to know when rewards have been distributed. Go to your favorite provider and get two urls, one for Ethereum mainnet and one for Polygon mainnet. Attention that the endpoint MUST start with "wss://" and MUST support "eth_subscribe". Most providers do support these features, but just in case, I tested using a free plan (NOT the public one) from [Blast](https://blastapi.io/):
 
 ```json
 "eth": {
@@ -115,7 +115,7 @@ docker run --rm -d -v`pwd`:/home/bot/telegram-bot docker-telegram-bot
 
 ## Find your chat id
 
-To finalize setup you need to fill in the chat id. The bot has two public commands (can be executed by anyone, unrestricted) and one of them is "/chatid". Just type it in, get the number that was outputed and get back to and fill it in the configuration file under "allowed_users".
+To finalize setup you need to fill in the chat id. The bot has two public commands (can be executed by anyone, unrestricted) and one of them is "/chatid". Just type it in, get the number that was outputed and fill it in the configuration file under "allowed_users".
 
 ## Finalize setup
 
