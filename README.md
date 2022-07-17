@@ -41,8 +41,7 @@ Some configuration is necessary at this step before actually running the bot. A 
 
 ```sh
 docker run --rm -it -v`pwd`:/home/bot/telegram-bot docker-telegram-bot /bin/bash
-(container) $ cd /home/bot/telegram-bot
-(container) $ python ./scripts/get_config.py
+(container) $ python ./scripts/gen_config.py
 (container) $ exit
 ```
 
@@ -160,3 +159,7 @@ Have a look at all the options you have available:
 ```sh
 /forta help
 ```
+
+## In the end
+
+This software is still work in progress. I am using it myself and I try to fix everything I find, so it will get more robust with time.
