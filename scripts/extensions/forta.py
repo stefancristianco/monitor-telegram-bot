@@ -4,8 +4,10 @@ Forta is the extension used to monitor forta-network scanner nodes.
 import logging
 import json
 import requests
+import asyncio
 
 from typing import Any, List
+from websockets import connect
 
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -73,14 +75,17 @@ class Forta(ExtensionBase):
         """
         self.config = forta_config
         try:
+            self.request_id = 0
             self.scanner_status = {}
+            self.wallet_status = {}
+
             self.user_config = {"scanners": {}, "wallets": {}, "threshold": "0.95"}
             with open(self.config["db_path"], "r") as infile:
                 self.user_config = json.load(infile)
-        except:
+        except FileNotFoundError:
             # Non critical error, as first time run it is expected
             # that this file is missing
-            logger.exception(f"Missing {self.config['db_path']}")
+            pass
 
         self.ERC20_ABI = {}
         with open("./scripts/extensions/abis/ERC20.json", "r") as infile:
@@ -94,16 +99,81 @@ class Forta(ExtensionBase):
         """
         return requests.get(f"{self.config['url']}{address}")
 
-    def job_name(self) -> str:
+    def scanner_job_name(self) -> str:
         """
-        Creates an unique job name for this extension.
+        Creates an unique job name for scanner monitoring job.
         :return: job name as string.
         """
-        return "FORTA"
+        return "FORTA#1"
 
-    async def execute_pooling(self, context: ContextTypes.DEFAULT_TYPE) -> None:
+    def wallet_job_name(self) -> str:
         """
-        Pool on forta SLA.
+        Creates an unique job name for wallet monitoring job.
+        :return: job name as string.
+        """
+        return "FORTA#2"
+
+    def wallet_address_to_name(self, address: str) -> str:
+        """
+        Find friendly name from wallet address.
+        :param address: the wallet address to match.
+        :return: wallet friendly name, or None if wallet address in not known.
+        """
+        for friendly_name in self.user_config["wallets"]:
+            wallet_address = self.user_config["wallets"][friendly_name]
+            if address == wallet_address:
+                return friendly_name
+        return None
+
+    async def wallet_execute_pooling(self, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """
+        Check for ERC20 Transfer event.
+        :return: None
+        """
+
+        def address_from_topic(topic: str) -> str:
+            return f"0x{topic[26:]}"
+
+        job = context.job
+        for chain_name in self.wallet_status:
+            connection = self.wallet_status[chain_name]["connection"]
+            try:
+                message = json.loads(
+                    await asyncio.wait_for(connection.recv(), timeout=1)
+                )
+            except asyncio.TimeoutError:
+                # Ignore exceptions from timeout
+                pass
+            else:
+                wallet_address = Web3.toChecksumAddress(
+                    address_from_topic(message["params"]["result"]["topics"][2])
+                )
+                wallet_name = self.wallet_address_to_name(wallet_address)
+
+                # Query balanceOf for wallet-token pair
+                provider = Web3(
+                    Web3.WebsocketProvider(self.config["chains"][chain_name]["url"])
+                )
+                if not provider.isConnected():
+                    alert = (
+                        f"WALLET ALERT\n{wallet_name}({chain_name}): connection failed"
+                    )
+                else:
+                    # Query balanceOf for wallet-token pair
+                    contract = provider.eth.contract(
+                        Web3.toChecksumAddress(message["params"]["result"]["address"]),
+                        abi=self.ERC20_ABI,
+                    )
+                    symbol = contract.functions.symbol().call()
+                    decimals = contract.functions.decimals().call()
+
+                    balance = contract.functions.balanceOf(wallet_address).call()
+                    alert = f"WALLET ALERT\n{wallet_name}({chain_name}): {Web3.fromWei(balance * 10 ** (18 - decimals), 'ether')} {symbol}"
+                await context.bot.send_message(chat_id=job.chat_id, text=alert)
+
+    async def scanner_execute_pooling(self, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """
+        Check scanner SLA.
         :return: None
         """
         job = context.job
@@ -129,52 +199,130 @@ class Forta(ExtensionBase):
                         f"SCANNER ALERT\n"
                         f"{friendly_name}: {json_sla['statistics']['avg']}"
                     )
-                    logger.info(f"New alert: {alert}")
                     await context.bot.send_message(chat_id=job.chat_id, text=alert)
+
                 # Remember this value so we produce new allerts only if SLA degrades
                 self.scanner_status[friendly_name] = json_sla["statistics"]["avg"]
             else:
-                logger.error(f"Request failed: {friendly_name} {sla}")
                 await context.bot.send_message(
                     chat_id=job.chat_id,
-                    text=(f"SCANNER ALERT\n{friendly_name}: request failed"),
+                    text=(
+                        f"SCANNER ALERT\n{friendly_name}: request failed ({sla.status_code})"
+                    ),
                 )
 
-    def remove_job_if_exists(self, context: ContextTypes.DEFAULT_TYPE) -> bool:
-        """
-        Remove forta monitor job.
-        :return: True if job was found and removed, False otherwise.
-        """
-        return remove_job_if_exists(context, self.job_name())
+    async def unsubscribe(self) -> None:
+        for chain_name in self.wallet_status:
+            connection = self.wallet_status[chain_name]["connection"]
+            subscription = self.wallet_status[chain_name]["subscription"]
+            json_dump = json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": self.request_id,
+                    "method": "eth_unsubscribe",
+                    "params": [subscription],
+                }
+            )
+            self.request_id += 1
+
+            try:
+                await connection.send(json_dump)
+                await connection.recv()
+                await connection.close()
+            except:
+                # Non critical
+                pass
+
+        self.wallet_status.clear()
+
+    async def subscribe(self) -> None:
+        def address_to_topic(address: str) -> str:
+            return f"0x000000000000000000000000{address[2:]}"
+
+        wallets = [
+            address_to_topic(self.user_config["wallets"][arg])
+            for arg in self.user_config["wallets"]
+        ]
+
+        for chain_name in self.config["chains"]:
+            json_dump = json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": self.request_id,
+                    "method": "eth_subscribe",
+                    "params": [
+                        "logs",
+                        {
+                            "address": self.config["chains"][chain_name]["token"],
+                            "topics": [
+                                "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+                                None,
+                                wallets,
+                            ],
+                        },
+                    ],
+                }
+            )
+            self.request_id += 1
+
+            connection = await connect(self.config["chains"][chain_name]["url"])
+            await connection.send(json_dump)
+            response = json.loads(await connection.recv())
+
+            if "result" in response:
+                subscription = response["result"]
+                self.wallet_status[chain_name] = {
+                    "connection": connection,
+                    "subscription": subscription,
+                }
+            else:
+                logger.error(response)
+                raise Exception(response)
 
     async def parse_action_start(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs
     ) -> None:
         """
-        Add a job to monitor scanner nodes.
+        Add a job to monitor scanner nodes and wallet transfers.
         :return: None
         """
-        job_removed = self.remove_job_if_exists(context)
-        logger.info(f"Monitor job removed (result:{job_removed})")
+        remove_job_if_exists(context, self.scanner_job_name())
+        remove_job_if_exists(context, self.wallet_job_name())
 
-        pooling_interval = float(self.config["pooling_interval"])
-        context.job_queue.run_repeating(
-            callback=self.execute_pooling,
-            interval=pooling_interval,
-            chat_id=update.message.chat_id,
-            name=self.job_name(),
-        )
-        await update.message.reply_text("Monitoring started")
+        await self.unsubscribe()
+        try:
+            await self.subscribe()
+        except:
+            await self.unsubscribe()
+            await update.message.reply_text("Operation failed")
+        else:
+            pooling_interval = float(self.config["scanner_pool_interval"])
+            context.job_queue.run_repeating(
+                callback=self.scanner_execute_pooling,
+                interval=pooling_interval,
+                chat_id=update.message.chat_id,
+                name=self.scanner_job_name(),
+            )
+            pooling_interval = float(self.config["wallet_pool_interval"])
+            context.job_queue.run_repeating(
+                callback=self.wallet_execute_pooling,
+                interval=pooling_interval,
+                chat_id=update.message.chat_id,
+                name=self.wallet_job_name(),
+            )
+            await update.message.reply_text("Monitoring started")
 
     async def parse_action_stop(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs
     ) -> None:
         """
-        Stop monitoring scanner nodes.
+        Stop monitoring scanner nodes and wallet transfers.
         :return: None
         """
-        job_removed = self.remove_job_if_exists(context)
-        logger.info(f"Monitor job removed (result:{job_removed})")
+        remove_job_if_exists(context, self.scanner_job_name())
+        remove_job_if_exists(context, self.wallet_job_name())
+
+        await self.unsubscribe()
 
         await update.message.reply_text("Monitoring stopped")
 
@@ -307,7 +455,7 @@ class Forta(ExtensionBase):
         """
         Dump SLA for all scanner nodes.
         """
-        status = "ACTIVE" if job_exist(context, self.job_name()) else "INACTIVE"
+        status = "ACTIVE" if job_exist(context, self.scanner_job_name()) else "INACTIVE"
         result = f"SCANNER STATUS ({status})\n"
         for friendly_name in self.user_config["scanners"]:
             sla = self.execute_request(self.user_config["scanners"][friendly_name])

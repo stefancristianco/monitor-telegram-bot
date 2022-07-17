@@ -20,27 +20,23 @@ def main() -> None:
         },
         "extensions": {
             "forta": {
-                "pooling_interval": "300",
+                "scanner_pool_interval": "300",
+                "wallet_pool_interval": "30",
                 "db_path": "forta.json",
                 "url": "https://api.forta.network/stats/sla/scanner/",
                 "chains": {
                     "eth": {
-                        "url": "wss://eth-mainnet.public.blastapi.io",
+                        "url": "wss://...",
                         "token": "0x41545f8b9472D758bB669ed8EaEEEcD7a9C4Ec29",
                     },
                     "matic": {
-                        "url": "wss://polygon-mainnet.public.blastapi.io",
+                        "url": "wss://...",
                         "token": "0x9ff62d1FC52A907B6DCbA8077c2DDCA6E6a9d3e1",
                     },
                 },
                 "description": "Scanner node monitoring and alerts extension.",
             },
             # "dummy": {"description": "Sample extension."},
-            # "erc20": {
-            #     "pooling_interval": "300",
-            #     "db_path": "erc20.json",
-            #     "description": "ERC20 monitor and alert on new transfers.",
-            # },
         },
     }
     with open(CONFIG_DB, "w") as outfile:
