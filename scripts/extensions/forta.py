@@ -7,7 +7,7 @@ import requests
 import asyncio
 
 from typing import Any, List
-from websockets import connect
+from websockets import connect, exceptions
 
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -144,6 +144,10 @@ class Forta(ExtensionBase):
             except asyncio.TimeoutError:
                 # Ignore exceptions from timeout
                 pass
+            except exceptions.ConnectionClosed:
+                # Connection was interrupted, reconnect
+                await self.subscribe_to_chain(chain_name)
+                pass
             else:
                 wallet_address = Web3.toChecksumAddress(
                     address_from_topic(message["params"]["result"]["topics"][2])
@@ -235,7 +239,7 @@ class Forta(ExtensionBase):
 
         self.wallet_status.clear()
 
-    async def subscribe(self) -> None:
+    async def subscribe_to_chain(self, chain_name: str) -> None:
         def address_to_topic(address: str) -> str:
             return f"0x000000000000000000000000{address[2:]}"
 
@@ -244,40 +248,43 @@ class Forta(ExtensionBase):
             for arg in self.user_config["wallets"]
         ]
 
+        json_dump = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": self.request_id,
+                "method": "eth_subscribe",
+                "params": [
+                    "logs",
+                    {
+                        "address": self.config["chains"][chain_name]["token"],
+                        "topics": [
+                            "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+                            None,
+                            wallets,
+                        ],
+                    },
+                ],
+            }
+        )
+        self.request_id += 1
+
+        connection = await connect(self.config["chains"][chain_name]["url"])
+        await connection.send(json_dump)
+        response = json.loads(await connection.recv())
+
+        if "result" in response:
+            subscription = response["result"]
+            self.wallet_status[chain_name] = {
+                "connection": connection,
+                "subscription": subscription,
+            }
+        else:
+            logger.error(response)
+            raise Exception(response)
+
+    async def subscribe(self) -> None:
         for chain_name in self.config["chains"]:
-            json_dump = json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "id": self.request_id,
-                    "method": "eth_subscribe",
-                    "params": [
-                        "logs",
-                        {
-                            "address": self.config["chains"][chain_name]["token"],
-                            "topics": [
-                                "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
-                                None,
-                                wallets,
-                            ],
-                        },
-                    ],
-                }
-            )
-            self.request_id += 1
-
-            connection = await connect(self.config["chains"][chain_name]["url"])
-            await connection.send(json_dump)
-            response = json.loads(await connection.recv())
-
-            if "result" in response:
-                subscription = response["result"]
-                self.wallet_status[chain_name] = {
-                    "connection": connection,
-                    "subscription": subscription,
-                }
-            else:
-                logger.error(response)
-                raise Exception(response)
+            await self.subscribe_to_chain(chain_name)
 
     async def parse_action_start(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs
