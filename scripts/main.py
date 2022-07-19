@@ -3,6 +3,7 @@
 """
 Main bot script.
 """
+import gc
 import logging
 
 from telegram import __version__ as TG_VER
@@ -99,6 +100,9 @@ def main() -> None:
     application.add_handler(CommandHandler("chatid", chatid))
 
     application.run_polling()
+
+    # Prevent some exceptions during shutdown
+    gc.collect()
 
 
 if __name__ == "__main__":

@@ -146,8 +146,8 @@ class Forta(ExtensionBase):
                 pass
             except exceptions.ConnectionClosed:
                 # Connection was interrupted, reconnect
-                await self.subscribe_to_chain(chain_name)
-                pass
+                await self.unsubscribe_from_chain(chain_name)
+                await self.subscribe_to_chain_noexcept(chain_name)
             else:
                 wallet_address = Web3.toChecksumAddress(
                     address_from_topic(message["params"]["result"]["topics"][2])
@@ -215,28 +215,35 @@ class Forta(ExtensionBase):
                     ),
                 )
 
+    async def unsubscribe_from_chain(self, chain_name: str) -> None:
+        connection = self.wallet_status[chain_name]["connection"]
+        subscription = self.wallet_status[chain_name]["subscription"]
+
+        json_dump = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": self.request_id,
+                "method": "eth_unsubscribe",
+                "params": [subscription],
+            }
+        )
+        self.request_id += 1
+
+        try:
+            await connection.send(json_dump)
+            await connection.recv()
+        except:
+            # Non critical, beset effort
+            pass
+        try:
+            await connection.close()
+        except:
+            # Non critical
+            pass
+
     async def unsubscribe(self) -> None:
         for chain_name in self.wallet_status:
-            connection = self.wallet_status[chain_name]["connection"]
-            subscription = self.wallet_status[chain_name]["subscription"]
-            json_dump = json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "id": self.request_id,
-                    "method": "eth_unsubscribe",
-                    "params": [subscription],
-                }
-            )
-            self.request_id += 1
-
-            try:
-                await connection.send(json_dump)
-                await connection.recv()
-                await connection.close()
-            except:
-                # Non critical
-                pass
-
+            await self.unsubscribe_from_chain(chain_name)
         self.wallet_status.clear()
 
     async def subscribe_to_chain(self, chain_name: str) -> None:
@@ -281,6 +288,13 @@ class Forta(ExtensionBase):
         else:
             logger.error(response)
             raise Exception(response)
+
+    async def subscribe_to_chain_noexcept(self, chain_name: str) -> None:
+        try:
+            await self.subscribe_to_chain(chain_name)
+        except:
+            logger.exception(f"Subscription failed for '{chain_name}'")
+            pass
 
     async def subscribe(self) -> None:
         for chain_name in self.config["chains"]:
