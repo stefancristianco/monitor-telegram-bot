@@ -27,10 +27,12 @@ def main() -> None:
                 "chains": {
                     "eth": {
                         "url": "wss://...",
+                        "confirmations": "6",
                         "token": "0x41545f8b9472D758bB669ed8EaEEEcD7a9C4Ec29",
                     },
                     "matic": {
                         "url": "wss://...",
+                        "confirmations": "30",
                         "token": "0x9ff62d1FC52A907B6DCbA8077c2DDCA6E6a9d3e1",
                     },
                 },

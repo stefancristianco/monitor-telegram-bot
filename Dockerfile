@@ -24,6 +24,7 @@ USER bot
 RUN pip install python-telegram-bot --pre && \
     pip install requests && \
     pip install web3 && \
+    pip install aiofiles && \
     pip install black
 
 CMD ["python", "./scripts/main.py"]
