@@ -3,12 +3,13 @@ Forta is the extension used to monitor forta-network scanner nodes.
 """
 import logging
 import json
-import requests
 import asyncio
+import copy
+import aiofiles
 
 from typing import Any, List
 from websockets import connect, exceptions
-
+from aiohttp import ClientSession
 from telegram import Update
 from telegram.ext import ContextTypes
 from web3 import Web3
@@ -33,7 +34,7 @@ AVAILABLE ACTIONS
     :param friendly-name: Friendly name for the scanner.
     :param address: Scanner address.
 [/forta scanner alert :sla-threshold:]
-    Set SLA threshold value for generating alerts (default: 0.95).
+    Set SLA threshold value for generating alerts (default: 0.90).
     :param sla-threshold: SLA threshold to produce alerts.
 [/forta scanner remove :friendly-name:]
     Remove a given scanner from monitoring list.
@@ -75,11 +76,7 @@ class Forta(ExtensionBase):
         """
         self.config = forta_config
         try:
-            self.request_id = 0
-            self.scanner_status = {}
-            self.wallet_status = {}
-
-            self.user_config = {"scanners": {}, "wallets": {}, "threshold": "0.95"}
+            self.user_config = {"scanners": {}, "wallets": {}, "threshold": "0.90"}
             with open(self.config["db_path"], "r") as infile:
                 self.user_config = json.load(infile)
         except FileNotFoundError:
@@ -91,13 +88,29 @@ class Forta(ExtensionBase):
         with open("./scripts/extensions/abis/ERC20.json", "r") as infile:
             self.ERC20_ABI = json.load(infile)
 
-    def execute_request(self, address: str) -> str:
+        self.request_id = 0
+        self.wallet_updated = False
+
+        self.scanner_current_sla = {}
+        self.scanner_prev_sla = {}
+
+        self.chain_data = {}
+        self.pending_signals = {}
+        self.final_signals = {}
+
+        for chain_name in self.config["chains"]:
+            self.pending_signals[chain_name] = {}
+
+    async def forta_fetch_sla(self, session: ClientSession, address: str) -> str:
         """
         Performs a get request to forta explorer service to obtain SLA.
         :param address: scanner node address to query.
         :return: http response as string.
         """
-        return requests.get(f"{self.config['url']}{address}")
+        resp = await session.request(method="GET", url=f"{self.config['url']}{address}")
+        resp.raise_for_status()
+
+        return json.loads(await resp.text())
 
     def scanner_job_name(self) -> str:
         """
@@ -106,12 +119,38 @@ class Forta(ExtensionBase):
         """
         return "FORTA#1"
 
+    def scanner_reader_job_name(self, update: Update) -> str:
+        """
+        Creates an unique job name for scanner monitoring job. One such job
+        is created per chat id, so each user can receive notifications.
+        :return: job name as string.
+        """
+        return f"FORTA#1#{update.message.chat_id}"
+
     def wallet_job_name(self) -> str:
         """
         Creates an unique job name for wallet monitoring job.
         :return: job name as string.
         """
         return "FORTA#2"
+
+    def wallet_reader_job_name(self, update: Update) -> str:
+        """
+        Creates an unique job name for wallet monitoring job. One such job
+        is created per chat id, so each user can receive notifications.
+        :return: job name as string.
+        """
+        return f"FORTA#2{update.message.chat_id}"
+
+    def get_block_confirmations(self, chain_name: str) -> int:
+        """
+        Get required block confirmations (backwards compatible with old configs).
+        :param chain_name: name of chain to query.
+        :return: nr block confirmations from config, or a default value if not available.
+        """
+        if "confirmations" in self.config["chains"][chain_name]:
+            return int(self.config["chains"][chain_name]["confirmations"])
+        return 5
 
     def wallet_address_to_name(self, address: str) -> str:
         """
@@ -125,99 +164,194 @@ class Forta(ExtensionBase):
                 return friendly_name
         return None
 
-    async def wallet_execute_pooling(self, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def connection_close_noexcept(self, connection) -> None:
         """
-        Check for ERC20 Transfer event.
+        Close a connection and hide all exceptions.
+        """
+        try:
+            await connection.close()
+        except:
+            # Non critical, best effort
+            pass
+
+    async def wallet_update_signals(self, *args, **kwargs) -> None:
+        """
+        Check for ERC20 Transfer events.
+        :return: None
+        """
+        # Check for new signals
+        for chain_name in self.config["chains"]:
+            # Try to subscribe if not already subscribed
+            if not chain_name in self.chain_data:
+                await self.subscribe_to_chain_noexcept(chain_name)
+            if not chain_name in self.chain_data:
+                # Connection failed, ignore for now
+                continue
+
+            # Check for events
+            connection = self.chain_data[chain_name]["connection"]
+            try:
+                message = json.loads(
+                    await asyncio.wait_for(connection.recv(), timeout=1)
+                )
+                result = message["params"]["result"]
+                if result["removed"]:
+                    if result["transactionHash"] in self.pending_signals[chain_name]:
+                        del self.pending_signals[chain_name][result["transactionHash"]]
+                else:
+                    self.pending_signals[chain_name][
+                        result["transactionHash"]
+                    ] = message
+            except asyncio.TimeoutError:
+                # Ignore exceptions from timeout
+                # This means there was nothing available to read from the socket
+                pass
+            except exceptions.ConnectionClosed:
+                # Connection was interrupted, cleanup to reconnect next time
+                await self.unsubscribe_from_chain_noexcept(chain_name)
+            except KeyError:
+                # Message is not valid, possibly an error condition from server
+                logger.exception(message)
+
+        # Check for signals with enough block confirmations and move to final list
+        for chain_name in self.config["chains"]:
+            # Skip if no events are available
+            if not len(self.pending_signals[chain_name]):
+                continue
+
+            # Get the latest block number
+            try:
+                provider = Web3(
+                    Web3.WebsocketProvider(self.config["chains"][chain_name]["url"])
+                )
+                block_number = provider.eth.get_block_number()
+            except:
+                logger.exception("Connection failed")
+            else:
+                required_confirmations = self.get_block_confirmations(chain_name)
+                for tx_hash in dict(self.pending_signals[chain_name]):
+                    message = self.pending_signals[chain_name][tx_hash]
+                    result = message["params"]["result"]
+                    message_block_number = int(result["blockNumber"], base=16)
+                    if block_number - message_block_number >= required_confirmations:
+                        # Message is old enough to be moved to final list
+                        for chat_id in self.final_signals:
+                            messages = []
+                            if chain_name in self.final_signals[chat_id]:
+                                messages = self.final_signals[chat_id][chain_name]
+                            messages.append(message)
+                            self.final_signals[chat_id][chain_name] = messages
+                        # Remove from processing queue
+                        del self.pending_signals[chain_name][tx_hash]
+
+        # Update subscriptions if new wallet was added or removed
+        if self.wallet_updated:
+            self.wallet_updated = False
+            for chain_name in self.config["chains"]:
+                await self.unsubscribe_from_chain_noexcept(chain_name)
+                await self.subscribe_to_chain_noexcept(chain_name)
+
+    async def wallet_display_signals(self, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """
+        Parse final signals and show to user.
         :return: None
         """
 
         def address_from_topic(topic: str) -> str:
             return f"0x{topic[26:]}"
 
-        job = context.job
-        for chain_name in self.wallet_status:
-            connection = self.wallet_status[chain_name]["connection"]
-            try:
-                message = json.loads(
-                    await asyncio.wait_for(connection.recv(), timeout=1)
-                )
-            except asyncio.TimeoutError:
-                # Ignore exceptions from timeout
-                pass
-            except exceptions.ConnectionClosed:
-                # Connection was interrupted, reconnect
-                await self.unsubscribe_from_chain(chain_name)
-                await self.subscribe_to_chain_noexcept(chain_name)
-            else:
+        alerts = []
+        for chain_name in self.final_signals[context.job.chat_id]:
+            for message in self.final_signals[context.job.chat_id][chain_name]:
+                result = message["params"]["result"]
                 wallet_address = Web3.toChecksumAddress(
-                    address_from_topic(message["params"]["result"]["topics"][2])
+                    address_from_topic(result["topics"][2])
                 )
                 wallet_name = self.wallet_address_to_name(wallet_address)
+                amount = Web3.toInt(hexstr=result["data"])
 
-                # Query balanceOf for wallet-token pair
-                provider = Web3(
-                    Web3.WebsocketProvider(self.config["chains"][chain_name]["url"])
-                )
-                if not provider.isConnected():
+                if chain_name in self.chain_data:
+                    symbol = self.chain_data[chain_name]["symbol"]
+                    decimals = self.chain_data[chain_name]["decimals"]
+
                     alert = (
-                        f"WALLET ALERT\n{wallet_name}({chain_name}): connection failed"
+                        f"WALLET ALERT\n"
+                        f"{wallet_name}({chain_name}): {Web3.fromWei(amount * 10 ** (18 - decimals), 'ether')} {symbol}"
                     )
                 else:
-                    # Query balanceOf for wallet-token pair
-                    contract = provider.eth.contract(
-                        Web3.toChecksumAddress(message["params"]["result"]["address"]),
-                        abi=self.ERC20_ABI,
+                    alert = (
+                        f"WALLET ALERT\n{wallet_name}({chain_name}): {amount} UNKNOWN"
                     )
-                    symbol = contract.functions.symbol().call()
-                    decimals = contract.functions.decimals().call()
+                alerts.append(alert)
+        # Remove processed signals
+        self.final_signals[context.job.chat_id] = {}
 
-                    balance = contract.functions.balanceOf(wallet_address).call()
-                    alert = f"WALLET ALERT\n{wallet_name}({chain_name}): {Web3.fromWei(balance * 10 ** (18 - decimals), 'ether')} {symbol}"
-                await context.bot.send_message(chat_id=job.chat_id, text=alert)
+        for alert in alerts:
+            await context.bot.send_message(chat_id=context.job.chat_id, text=alert)
 
-    async def scanner_execute_pooling(self, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def read_scanner_sla(self, *args, **kwargs) -> None:
         """
-        Check scanner SLA.
+        Read scanner nodes SLA.
         :return: None
         """
-        job = context.job
-        for friendly_name in self.user_config["scanners"]:
-            address = self.user_config["scanners"][friendly_name]
-            sla = self.execute_request(address)
-            if sla.status_code == 200:
-                json_sla = json.loads(sla.text)
-                if friendly_name in self.scanner_status:
-                    if float(self.scanner_status[friendly_name]) <= float(
-                        json_sla["statistics"]["avg"]
-                    ):
-                        # Only produce alerts if conditions degrade
-                        self.scanner_status[friendly_name] = json_sla["statistics"][
-                            "avg"
-                        ]
-                        continue
+        scanner_next_sla = {}
+        async with ClientSession() as session:
+            scanners = copy.deepcopy(self.user_config["scanners"])
+            for friendly_name in scanners:
+                address = scanners[friendly_name]
+                try:
+                    sla = await self.forta_fetch_sla(session, address)
+                except:
+                    logger.exception(f"Request failed: {friendly_name}")
+                else:
+                    scanner_next_sla[friendly_name] = float(sla["statistics"]["avg"])
+        self.scanner_current_sla = scanner_next_sla
 
-                if float(json_sla["statistics"]["avg"]) <= float(
-                    self.user_config["threshold"]
-                ):
-                    alert = (
-                        f"SCANNER ALERT\n"
-                        f"{friendly_name}: {json_sla['statistics']['avg']}"
-                    )
-                    await context.bot.send_message(chat_id=job.chat_id, text=alert)
+    async def scanner_check_alerts(self, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """
+        Check cached scanner SLA and produce alerts.
+        :return: None
+        """
+        config_threshold = float(self.user_config["threshold"])
 
-                # Remember this value so we produce new allerts only if SLA degrades
-                self.scanner_status[friendly_name] = json_sla["statistics"]["avg"]
-            else:
-                await context.bot.send_message(
-                    chat_id=job.chat_id,
-                    text=(
-                        f"SCANNER ALERT\n{friendly_name}: request failed ({sla.status_code})"
-                    ),
+        alerts = []
+        for friendly_name in self.scanner_current_sla:
+            if (
+                context.job.chat_id in self.scanner_prev_sla
+                and friendly_name in self.scanner_prev_sla[context.job.chat_id]
+            ):
+                threshold = min(
+                    config_threshold,
+                    self.scanner_prev_sla[context.job.chat_id][friendly_name],
                 )
+            else:
+                threshold = config_threshold
 
-    async def unsubscribe_from_chain(self, chain_name: str) -> None:
-        connection = self.wallet_status[chain_name]["connection"]
-        subscription = self.wallet_status[chain_name]["subscription"]
+            if self.scanner_current_sla[friendly_name] < threshold:
+                alert = (
+                    f"SCANNER ALERT\n"
+                    f"{friendly_name}: {self.scanner_current_sla[friendly_name]}"
+                )
+                alerts.append(alert)
+
+        # Record prev SLA in order to produce alerts only if conditions degrade
+        self.scanner_prev_sla[context.job.chat_id] = copy.deepcopy(
+            self.scanner_current_sla
+        )
+
+        for alert in alerts:
+            await context.bot.send_message(chat_id=context.job.chat_id, text=alert)
+
+    async def unsubscribe_from_chain_noexcept(self, chain_name: str) -> None:
+        """
+        Unsubscribe from chain events.
+        :param chain_name: chain to unsubscribe from.
+        :return: None
+        """
+        connection = self.chain_data[chain_name]["connection"]
+        subscription = self.chain_data[chain_name]["subscription"]
+
+        del self.chain_data[chain_name]
 
         json_dump = json.dumps(
             {
@@ -233,20 +367,17 @@ class Forta(ExtensionBase):
             await connection.send(json_dump)
             await connection.recv()
         except:
-            # Non critical, beset effort
+            # Non critical, best effort
             pass
-        try:
-            await connection.close()
-        except:
-            # Non critical
-            pass
+        await self.connection_close_noexcept(connection)
 
-    async def unsubscribe(self) -> None:
-        for chain_name in self.wallet_status:
-            await self.unsubscribe_from_chain(chain_name)
-        self.wallet_status.clear()
+    async def subscribe_to_chain_noexcept(self, chain_name: str) -> None:
+        """
+        Subscribe for events for given chain.
+        :param chain_name: chain to subscribe to.
+        :return: None
+        """
 
-    async def subscribe_to_chain(self, chain_name: str) -> None:
         def address_to_topic(address: str) -> str:
             return f"0x000000000000000000000000{address[2:]}"
 
@@ -254,7 +385,6 @@ class Forta(ExtensionBase):
             address_to_topic(self.user_config["wallets"][arg])
             for arg in self.user_config["wallets"]
         ]
-
         json_dump = json.dumps(
             {
                 "jsonrpc": "2.0",
@@ -275,30 +405,33 @@ class Forta(ExtensionBase):
         )
         self.request_id += 1
 
-        connection = await connect(self.config["chains"][chain_name]["url"])
-        await connection.send(json_dump)
-        response = json.loads(await connection.recv())
+        try:
+            connection = await connect(self.config["chains"][chain_name]["url"])
 
-        if "result" in response:
+            await connection.send(json_dump)
+            response = json.loads(await connection.recv())
+
             subscription = response["result"]
-            self.wallet_status[chain_name] = {
+
+            provider = Web3(
+                Web3.WebsocketProvider(self.config["chains"][chain_name]["url"])
+            )
+            contract = provider.eth.contract(
+                self.config["chains"][chain_name]["token"],
+                abi=self.ERC20_ABI,
+            )
+            symbol = contract.functions.symbol().call()
+            decimals = contract.functions.decimals().call()
+
+            self.chain_data[chain_name] = {
                 "connection": connection,
                 "subscription": subscription,
+                "symbol": symbol,
+                "decimals": decimals,
             }
-        else:
-            logger.error(response)
-            raise Exception(response)
-
-    async def subscribe_to_chain_noexcept(self, chain_name: str) -> None:
-        try:
-            await self.subscribe_to_chain(chain_name)
         except:
-            logger.exception(f"Subscription failed for '{chain_name}'")
-            pass
-
-    async def subscribe(self) -> None:
-        for chain_name in self.config["chains"]:
-            await self.subscribe_to_chain(chain_name)
+            logger.exception("Subscribe failed {response}")
+            await self.connection_close_noexcept(connection)
 
     async def parse_action_start(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs
@@ -307,31 +440,41 @@ class Forta(ExtensionBase):
         Add a job to monitor scanner nodes and wallet transfers.
         :return: None
         """
-        remove_job_if_exists(context, self.scanner_job_name())
-        remove_job_if_exists(context, self.wallet_job_name())
 
-        await self.unsubscribe()
-        try:
-            await self.subscribe()
-        except:
-            await self.unsubscribe()
-            await update.message.reply_text("Operation failed")
-        else:
-            pooling_interval = float(self.config["scanner_pool_interval"])
+        # Prepare scanner monitor jobs
+        pooling_interval = float(self.config["scanner_pool_interval"])
+        if not job_exist(context, self.scanner_job_name()):
             context.job_queue.run_repeating(
-                callback=self.scanner_execute_pooling,
+                callback=self.read_scanner_sla,
                 interval=pooling_interval,
-                chat_id=update.message.chat_id,
                 name=self.scanner_job_name(),
             )
-            pooling_interval = float(self.config["wallet_pool_interval"])
+        remove_job_if_exists(context, self.scanner_reader_job_name(update))
+        context.job_queue.run_repeating(
+            callback=self.scanner_check_alerts,
+            interval=pooling_interval // 2,
+            chat_id=update.message.chat_id,
+            name=self.scanner_reader_job_name(update),
+        )
+
+        # Prepare wallet monitor jobs
+        pooling_interval = float(self.config["wallet_pool_interval"])
+        if not job_exist(context, self.wallet_job_name()):
             context.job_queue.run_repeating(
-                callback=self.wallet_execute_pooling,
+                callback=self.wallet_update_signals,
                 interval=pooling_interval,
-                chat_id=update.message.chat_id,
                 name=self.wallet_job_name(),
             )
-            await update.message.reply_text("Monitoring started")
+        remove_job_if_exists(context, self.wallet_reader_job_name(update))
+        context.job_queue.run_repeating(
+            callback=self.wallet_display_signals,
+            interval=pooling_interval // 2,
+            chat_id=update.message.chat_id,
+            name=self.wallet_reader_job_name(update),
+        )
+        self.final_signals[update.message.chat_id] = {}
+
+        await update.message.reply_text("Monitoring started")
 
     async def parse_action_stop(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs
@@ -340,10 +483,10 @@ class Forta(ExtensionBase):
         Stop monitoring scanner nodes and wallet transfers.
         :return: None
         """
-        remove_job_if_exists(context, self.scanner_job_name())
-        remove_job_if_exists(context, self.wallet_job_name())
+        remove_job_if_exists(context, self.scanner_reader_job_name(update))
 
-        await self.unsubscribe()
+        remove_job_if_exists(context, self.wallet_reader_job_name(update))
+        del self.final_signals[update.message.chat_id]
 
         await update.message.reply_text("Monitoring stopped")
 
@@ -390,27 +533,29 @@ class Forta(ExtensionBase):
         try:
             friendly_name = args[0]
             address = args[1]
+        except IndexError:
+            await update.message.reply_text(
+                text="Invalid action 'scanner add' arguments"
+            )
+        else:
             if not validate_name(friendly_name):
                 await update.message.reply_text(text="Friendly name not valid")
             elif not validate_address(address):
                 await update.message.reply_text(text="Scanner address format not valid")
             else:
-                sla = self.execute_request(address)
-                if sla.status_code != 200:
+                try:
+                    async with ClientSession() as session:
+                        await self.forta_fetch_sla(session, address)
+                except:
                     await update.message.reply_text(text="Scanner address not valid")
                 else:
                     self.user_config["scanners"][friendly_name] = address
-                    with open(self.config["db_path"], "w") as outfile:
-                        json.dump(self.user_config, outfile)
+                    async with aiofiles.open(self.config["db_path"], "w") as outfile:
+                        await outfile.write(json.dumps(self.user_config))
 
                     await update.message.reply_text(
                         text=f"SCANNER UPDATED\n{friendly_name}: {address}"
                     )
-        except IndexError:
-            logger.exception("Invalid action 'scanner add' arguments")
-            await update.message.reply_text(
-                text="Invalid action 'scanner add' arguments"
-            )
 
     async def parse_action_scanner_remove(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE, args: List[str]
@@ -422,25 +567,23 @@ class Forta(ExtensionBase):
         """
         try:
             friendly_name = args[0]
+        except IndexError:
+            await update.message.reply_text(
+                text="Invalid action 'scanner remove' arguments"
+            )
+        else:
             if not validate_name(friendly_name):
                 await update.message.reply_text(text="Friendly name not valid")
             elif not friendly_name in self.user_config["scanners"]:
                 await update.message.reply_text(text="Unknown scanner name")
             else:
                 del self.user_config["scanners"][friendly_name]
-                if friendly_name in self.scanner_status:
-                    del self.scanner_status[friendly_name]
-                with open(self.config["db_path"], "w") as outfile:
-                    json.dump(self.user_config, outfile)
+                async with aiofiles.open(self.config["db_path"], "w") as outfile:
+                    await outfile.write(json.dumps(self.user_config))
 
                 await update.message.reply_text(
                     text=f"SCANNER REMOVED\n{friendly_name}"
                 )
-        except IndexError:
-            logger.exception("Invalid action 'scanner remove' arguments")
-            await update.message.reply_text(
-                text="Invalid action 'scanner remove' arguments"
-            )
 
     async def parse_action_scanner_alert(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE, args: List[str]
@@ -452,23 +595,26 @@ class Forta(ExtensionBase):
         """
         try:
             threshold = float(args[0])
-            if threshold <= 0 or threshold >= 1:
-                await update.message.reply_text(text="Threshold interval is (0..1)")
-            self.user_config["threshold"] = threshold
-            with open(self.config["db_path"], "w") as outfile:
-                json.dump(self.user_config, outfile)
-            self.scanner_status.clear()
-            await update.message.reply_text(
-                text=f"ALERT UPDATED\nsla-threshold: {threshold}"
-            )
         except IndexError:
-            logger.exception("Invalid action 'scanner alert' arguments")
             await update.message.reply_text(
                 text="Invalid action 'scanner alert' arguments"
             )
         except ValueError:
-            logger.exception("Invalid number value")
-            await update.message.reply_text(text="Invalid number value")
+            await update.message.reply_text(text="Invalid number format")
+        else:
+            if threshold <= 0 or threshold >= 1:
+                await update.message.reply_text(text="Threshold interval is (0..1)")
+            else:
+                # Clear saved SLA to produce fresh alerts
+                self.scanner_prev_sla.clear()
+
+                self.user_config["threshold"] = threshold
+                async with aiofiles.open(self.config["db_path"], "w") as outfile:
+                    await outfile.write(json.dumps(self.user_config))
+
+                await update.message.reply_text(
+                    text=f"ALERT UPDATED\nsla-threshold: {threshold}"
+                )
 
     async def parse_action_scanner_status(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs
@@ -476,17 +622,24 @@ class Forta(ExtensionBase):
         """
         Dump SLA for all scanner nodes.
         """
-        status = "ACTIVE" if job_exist(context, self.scanner_job_name()) else "INACTIVE"
+        status = (
+            "ACTIVE"
+            if job_exist(context, self.scanner_reader_job_name(update))
+            else "INACTIVE"
+        )
+        if not len(self.scanner_current_sla) or not job_exist(
+            context, self.scanner_job_name()
+        ):
+            # Scanner SLA is not periodically read, so we must get new values
+            await self.read_scanner_sla()
+
         result = f"SCANNER STATUS ({status})\n"
-        for friendly_name in self.user_config["scanners"]:
-            sla = self.execute_request(self.user_config["scanners"][friendly_name])
-            if sla.status_code == 200:
-                json_sla = json.loads(sla.text)
-                result = f"{result}\n{friendly_name}: {json_sla['statistics']['avg']}"
-            else:
-                logger.error(f"Failed request for: {friendly_name} {sla}")
-                result = f"{result}\n{friendly_name}: FAILED"
-        result = f"{result}\nCOUNT: {len(self.user_config['scanners'])}"
+        for friendly_name in self.scanner_current_sla:
+            result = (
+                f"{result}\n{friendly_name}: {self.scanner_current_sla[friendly_name]}"
+            )
+        result = f"{result}\nCOUNT: {len(self.scanner_current_sla)}"
+
         await update.message.reply_text(text=result)
 
     async def parse_action_scanner_list(
@@ -498,6 +651,7 @@ class Forta(ExtensionBase):
         result = f"SCANNER CONFIG (SLA-THRESHOLD: {self.user_config['threshold']})\n"
         for friendly_name in self.user_config["scanners"]:
             result = f"{result}\n{friendly_name}:\n  * {self.user_config['scanners'][friendly_name]}"
+        result = f"{result}\nCOUNT: {len(self.user_config['scanners'])}"
         await update.message.reply_text(text=result)
 
     async def parse_action_scanner(
@@ -527,23 +681,26 @@ class Forta(ExtensionBase):
         try:
             friendly_name = args[0]
             address = args[1]
+        except IndexError:
+            await update.message.reply_text(
+                text="Invalid action 'wallet add' arguments"
+            )
+        else:
             if not validate_name(friendly_name):
                 await update.message.reply_text(text="Friendly name not valid")
             elif not validate_address(address):
                 await update.message.reply_text(text="Wallet address format not valid")
             else:
+                # Trigger subscription reset
+                self.wallet_updated = True
+
                 self.user_config["wallets"][friendly_name] = address
-                with open(self.config["db_path"], "w") as outfile:
-                    json.dump(self.user_config, outfile)
+                async with aiofiles.open(self.config["db_path"], "w") as outfile:
+                    await outfile.write(json.dumps(self.user_config))
 
                 await update.message.reply_text(
                     text=f"WALLET UPDATED\n{friendly_name}: {address}"
                 )
-        except IndexError:
-            logger.exception("Invalid action 'wallet add' arguments")
-            await update.message.reply_text(
-                text="Invalid action 'wallet add' arguments"
-            )
 
     async def parse_action_wallet_remove(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE, args: List[str]
@@ -555,19 +712,22 @@ class Forta(ExtensionBase):
         """
         try:
             friendly_name = args[0]
-            if not friendly_name in self.user_config["wallets"]:
-                await update.message.reply_text(text="Unknown wallet name")
-            else:
-                del self.user_config["wallets"][friendly_name]
-                with open(self.config["db_path"], "w") as outfile:
-                    json.dump(self.user_config, outfile)
-
-                await update.message.reply_text(text=f"WALLET REMOVED\n{friendly_name}")
         except IndexError:
-            logger.exception("Invalid action 'wallet remove' arguments")
             await update.message.reply_text(
                 text="Invalid action 'wallet remove' arguments"
             )
+        else:
+            if not friendly_name in self.user_config["wallets"]:
+                await update.message.reply_text(text="Unknown wallet name")
+            else:
+                # Trigger subscription reset
+                self.wallet_updated = True
+
+                del self.user_config["wallets"][friendly_name]
+                async with aiofiles.open(self.config["db_path"], "w") as outfile:
+                    await outfile.write(json.dumps(self.user_config))
+
+                await update.message.reply_text(text=f"WALLET REMOVED\n{friendly_name}")
 
     async def parse_action_wallet_balance(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE, args: List[str]
@@ -579,6 +739,11 @@ class Forta(ExtensionBase):
         """
         try:
             friendly_name = args[0]
+        except IndexError:
+            await update.message.reply_text(
+                text="Invalid action 'wallet balance' arguments"
+            )
+        else:
             if not friendly_name in self.user_config["wallets"]:
                 await update.message.reply_text(text="Unknown wallet name")
             else:
@@ -587,28 +752,20 @@ class Forta(ExtensionBase):
                     provider = Web3(
                         Web3.WebsocketProvider(self.config["chains"][chain_name]["url"])
                     )
-                    if not provider.isConnected():
-                        result = f"{result}\n{chain_name}: connection failed"
-                    else:
-                        # Query balanceOf for wallet-token pair
-                        contract = provider.eth.contract(
-                            self.config["chains"][chain_name]["token"],
-                            abi=self.ERC20_ABI,
-                        )
-                        symbol = contract.functions.symbol().call()
-                        decimals = contract.functions.decimals().call()
+                    # Query balanceOf for wallet-token pair
+                    contract = provider.eth.contract(
+                        self.config["chains"][chain_name]["token"],
+                        abi=self.ERC20_ABI,
+                    )
+                    symbol = contract.functions.symbol().call()
+                    decimals = contract.functions.decimals().call()
 
-                        wallet = self.user_config["wallets"][friendly_name]
-                        balance = contract.functions.balanceOf(wallet).call()
+                    wallet = self.user_config["wallets"][friendly_name]
+                    balance = contract.functions.balanceOf(wallet).call()
 
-                        result = f"{result}\n{chain_name}: {Web3.fromWei(balance * 10 ** (18 - decimals), 'ether')} {symbol}"
+                    result = f"{result}\n{chain_name}: {Web3.fromWei(balance * 10 ** (18 - decimals), 'ether')} {symbol}"
 
                 await update.message.reply_text(text=result)
-        except IndexError:
-            logger.exception("Invalid action 'wallet balance' arguments")
-            await update.message.reply_text(
-                text="Invalid action 'wallet balance' arguments"
-            )
 
     async def parse_action_wallet_list(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs
