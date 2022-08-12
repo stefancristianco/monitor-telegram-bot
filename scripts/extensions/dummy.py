@@ -12,7 +12,7 @@ class Dummy(ExtensionBase):
     Dummy extension.
     """
 
-    def __init__(self, dummy_config) -> None:
+    def __init__(self, *args, **kwargs) -> None:
         """
         Init all variables and objects.
         """

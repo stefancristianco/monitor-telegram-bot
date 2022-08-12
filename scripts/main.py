@@ -5,6 +5,7 @@ Main bot script.
 """
 import gc
 import logging
+from time import sleep
 
 from telegram import __version__ as TG_VER
 
@@ -84,7 +85,9 @@ def main() -> None:
     )
 
     extensions = {
-        ext_name: get_extension_by_name(ext_name)(config["extensions"][ext_name])
+        ext_name: get_extension_by_name(ext_name)(
+            config["extensions"][ext_name], application
+        )
         for ext_name in config["extensions"]
     }
     for ext_name in extensions:
