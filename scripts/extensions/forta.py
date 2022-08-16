@@ -175,7 +175,7 @@ class Forta(ExtensionBase):
         # Prepare scanner monitor jobs
         pooling_interval = float(self.config["scanner_pool_interval"])
         app.job_queue.run_repeating(
-            callback=self.read_scanner_sla,
+            callback=self.read_scanner_sla_job,
             interval=pooling_interval,
             name=self.scanner_job_name(),
         )
@@ -439,10 +439,17 @@ class Forta(ExtensionBase):
         for alert in alerts:
             await context.bot.send_message(chat_id=context.job.chat_id, text=alert)
 
-    async def read_scanner_sla(self, *args, **kwargs) -> None:
+    async def read_scanner_sla_job(self, *args, **kwargs) -> None:
+        """
+        Read scanner nodes SLA job.
+        :return: None
+        """
+        self.scanner_current_sla = await self.read_scanner_sla()
+
+    async def read_scanner_sla(self):
         """
         Read scanner nodes SLA.
-        :return: None
+        :return: dict of {scanner_name: SLA}
         """
         tasks = []
         scanner_next_sla = {}
@@ -464,7 +471,8 @@ class Forta(ExtensionBase):
                     logger.exception(f"Request failed")
                 else:
                     scanner_next_sla[friendly_name] = float(sla["statistics"]["avg"])
-            self.scanner_current_sla = scanner_next_sla
+
+        return scanner_next_sla
 
     async def scanner_check_alerts(self, context: ContextTypes.DEFAULT_TYPE) -> None:
         """
@@ -683,15 +691,12 @@ class Forta(ExtensionBase):
             if job_exist(context, self.scanner_reader_job_name(update))
             else "INACTIVE"
         )
-        if not len(self.scanner_current_sla):
-            await self.read_scanner_sla()
+        current_sla = await self.read_scanner_sla()
 
         result = f"SCANNER STATUS ({status})\n"
-        for friendly_name in self.scanner_current_sla:
-            result = (
-                f"{result}\n{friendly_name}: {self.scanner_current_sla[friendly_name]}"
-            )
-        result = f"{result}\nCOUNT: {len(self.scanner_current_sla)}"
+        for friendly_name in current_sla:
+            result = f"{result}\n{friendly_name}: {current_sla[friendly_name]}"
+        result = f"{result}\nCOUNT: {len(current_sla)}"
 
         await update.message.reply_text(text=result)
 
