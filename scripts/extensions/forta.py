@@ -694,7 +694,7 @@ class Forta(ExtensionBase):
         current_sla = await self.read_scanner_sla()
 
         result = f"SCANNER STATUS ({status})\n"
-        for friendly_name in current_sla:
+        for friendly_name in sorted(current_sla):
             result = f"{result}\n{friendly_name}: {current_sla[friendly_name]}"
         result = f"{result}\nCOUNT: {len(current_sla)}"
 
