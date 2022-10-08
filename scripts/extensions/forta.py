@@ -494,6 +494,9 @@ class Forta(ExtensionBase):
             else:
                 threshold = config_threshold
 
+            # stop showing alerts for scanners with near 0 SLA
+            threshold = 0 if threshold < 0.1 else threshold
+
             if self.scanner_current_sla[friendly_name] < threshold:
                 alert = (
                     f"SCANNER ALERT\n"
