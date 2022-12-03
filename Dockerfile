@@ -21,7 +21,7 @@ WORKDIR /home/bot/telegram-bot
 USER bot
 
 # Install development tools
-RUN pip install python-telegram-bot --pre && \
+RUN pip install python-telegram-bot==v20.0a4 && \
     pip install requests && \
     pip install web3 && \
     pip install aiofiles && \
