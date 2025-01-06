@@ -82,12 +82,10 @@ class Forta(ExtensionBase):
             "forta_scanner_sla", "SLA of Forta scanner nodes", ["scanner_name"]
         )
 
+        self.config = config
         prometheus_port = self.config.get("prometheus_port", 8123)
         start_http_server(prometheus_port)
 
-        self.start_global_jobs(app)
-
-        self.config = config
         try:
             self.user_config = {"scanners": {}, "wallets": {}, "threshold": "0.90"}
             with open(self.config["db_path"], "r") as infile:
