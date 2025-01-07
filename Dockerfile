@@ -25,6 +25,10 @@ RUN pip install python-telegram-bot==v20.0a4 && \
     pip install requests && \
     pip install web3 && \
     pip install aiofiles && \
-    pip install black
+    pip install black && \
+    pip install prometheus_client
+
+
+EXPOSE 8123
 
 CMD ["python", "./scripts/main.py"]

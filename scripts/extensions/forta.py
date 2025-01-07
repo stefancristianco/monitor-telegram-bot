@@ -1,6 +1,7 @@
 """
 Forta is the extension used to monitor forta-network scanner nodes.
 """
+
 from ast import excepthandler
 import logging
 import json
@@ -13,6 +14,8 @@ from aiohttp import ClientSession
 from telegram import Update
 from telegram.ext import ContextTypes, Application
 from web3 import Web3
+from prometheus_client import Gauge, start_http_server
+
 
 from helpers.utils import (
     job_exist,
@@ -74,7 +77,15 @@ class Forta(ExtensionBase):
         Init all variables and objects the bot needs to work.
         :param forta_config: forta specific configuration.
         """
+
+        self.prometheus_sla_gauge = Gauge(
+            "forta_scanner_sla", "SLA of Forta scanner nodes", ["scanner_name"]
+        )
+
         self.config = config
+        prometheus_port = self.config.get("prometheus_port", 8123)
+        start_http_server(prometheus_port)
+
         try:
             self.user_config = {"scanners": {}, "wallets": {}, "threshold": "0.90"}
             with open(self.config["db_path"], "r") as infile:
@@ -470,7 +481,11 @@ class Forta(ExtensionBase):
                 except:
                     logger.exception(f"Request failed")
                 else:
-                    scanner_next_sla[friendly_name] = float(sla["statistics"]["avg"])
+                    score = float(sla["statistics"]["avg"])
+                    scanner_next_sla[friendly_name] = score
+                    self.prometheus_sla_gauge.labels(scanner_name=friendly_name).set(
+                        score
+                    )
 
         return scanner_next_sla
 
